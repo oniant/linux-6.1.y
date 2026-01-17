@@ -81,6 +81,12 @@ static struct shash_desc *alloc_shash_desc(int id)
 	case CRYPTO_SHASH_SHA512:
 		tfm = crypto_alloc_shash("sha512", 0, 0);
 		break;
+	case CRYPTO_SHASH_MD4:
+		tfm = crypto_alloc_shash("md4", 0, 0);
+		break;
+	case CRYPTO_SHASH_MD5:
+		tfm = crypto_alloc_shash("md5", 0, 0);
+		break;
 	default:
 		return NULL;
 	}
@@ -89,7 +95,7 @@ static struct shash_desc *alloc_shash_desc(int id)
 		return NULL;
 
 	shash = kzalloc(sizeof(*shash) + crypto_shash_descsize(tfm),
-			GFP_KERNEL);
+			KSMBD_DEFAULT_GFP);
 	if (!shash)
 		crypto_free_shash(tfm);
 	else
@@ -133,7 +139,7 @@ static struct ksmbd_crypto_ctx *ksmbd_find_crypto_ctx(void)
 		ctx_list.avail_ctx++;
 		spin_unlock(&ctx_list.ctx_lock);
 
-		ctx = kzalloc(sizeof(struct ksmbd_crypto_ctx), GFP_KERNEL);
+		ctx = kzalloc(sizeof(struct ksmbd_crypto_ctx), KSMBD_DEFAULT_GFP);
 		if (!ctx) {
 			spin_lock(&ctx_list.ctx_lock);
 			ctx_list.avail_ctx--;
@@ -208,6 +214,16 @@ struct ksmbd_crypto_ctx *ksmbd_crypto_ctx_find_sha512(void)
 	return ____crypto_shash_ctx_find(CRYPTO_SHASH_SHA512);
 }
 
+struct ksmbd_crypto_ctx *ksmbd_crypto_ctx_find_md4(void)
+{
+	return ____crypto_shash_ctx_find(CRYPTO_SHASH_MD4);
+}
+
+struct ksmbd_crypto_ctx *ksmbd_crypto_ctx_find_md5(void)
+{
+	return ____crypto_shash_ctx_find(CRYPTO_SHASH_MD5);
+}
+
 static struct ksmbd_crypto_ctx *____crypto_aead_ctx_find(int id)
 {
 	struct ksmbd_crypto_ctx *ctx;
@@ -258,7 +274,7 @@ int ksmbd_crypto_create(void)
 	init_waitqueue_head(&ctx_list.ctx_wait);
 	ctx_list.avail_ctx = 1;
 
-	ctx = kzalloc(sizeof(struct ksmbd_crypto_ctx), GFP_KERNEL);
+	ctx = kzalloc(sizeof(struct ksmbd_crypto_ctx), KSMBD_DEFAULT_GFP);
 	if (!ctx)
 		return -ENOMEM;
 	list_add(&ctx->list, &ctx_list.idle_ctx);

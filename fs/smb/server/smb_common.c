@@ -7,6 +7,7 @@
 #include <linux/user_namespace.h>
 
 #include "smb_common.h"
+#include "smb1pdu.h"
 #include "server.h"
 #include "misc.h"
 #include "smbstatus.h"
@@ -24,6 +25,12 @@ static const char *basechars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_-!@#$%";
 #define PERIOD '.'
 #define mangle(V) ((char)(basechars[(V) % MANGLE_BASE]))
 
+#ifdef CONFIG_SMB_INSECURE_SERVER
+#define KSMBD_MIN_SUPPORTED_HEADER_SIZE	(sizeof(struct smb_hdr))
+#else
+#define KSMBD_MIN_SUPPORTED_HEADER_SIZE	(sizeof(struct smb2_hdr))
+#endif
+
 struct smb_protocol {
 	int		index;
 	char		*name;
@@ -32,12 +39,20 @@ struct smb_protocol {
 };
 
 static struct smb_protocol smb1_protos[] = {
+#ifdef CONFIG_SMB_INSECURE_SERVER
 	{
-		SMB21_PROT,
-		"\2SMB 2.1",
-		"SMB2_10",
-		SMB21_PROT_ID
+		SMB1_PROT,
+		"\2NT LM 0.12",
+		"NT1",
+		SMB10_PROT_ID
 	},
+	{
+		SMB2_PROT,
+		"\2SMB 2.002",
+		"SMB2_02",
+		SMB20_PROT_ID
+	},
+#endif
 	{
 		SMB2X_PROT,
 		"\2SMB 2.???",
@@ -47,6 +62,12 @@ static struct smb_protocol smb1_protos[] = {
 };
 
 static struct smb_protocol smb2_protos[] = {
+	{
+		SMB2_PROT,
+		"\2SMB 2.002",
+		"SMB2_02",
+		SMB20_PROT_ID
+	},
 	{
 		SMB21_PROT,
 		"\2SMB 2.1",
@@ -90,7 +111,11 @@ unsigned int ksmbd_server_side_copy_max_total_size(void)
 
 inline int ksmbd_min_protocol(void)
 {
-	return SMB21_PROT;
+#ifdef CONFIG_SMB_INSECURE_SERVER
+	return SMB1_PROT;
+#else
+	return SMB2_PROT;
+#endif
 }
 
 inline int ksmbd_max_protocol(void)
@@ -130,11 +155,21 @@ int ksmbd_lookup_protocol_idx(char *str)
  *
  * check for valid smb signature and packet direction(request/response)
  *
- * Return:      0 on success, otherwise -EINVAL
+ * Return:      0 on success, otherwise error
  */
 int ksmbd_verify_smb_message(struct ksmbd_work *work)
 {
 	struct smb2_hdr *smb2_hdr = ksmbd_req_buf_next(work);
+
+#ifdef CONFIG_SMB_INSECURE_SERVER
+	if (smb2_hdr->ProtocolId == SMB2_PROTO_NUMBER) {
+		ksmbd_debug(SMB, "got SMB2 command\n");
+		return ksmbd_smb2_check_message(work);
+	}
+
+	work->conn->outstanding_credits++;
+	return ksmbd_smb1_check_message(work);
+#else
 	struct smb_hdr *hdr;
 
 	if (smb2_hdr->ProtocolId == SMB2_PROTO_NUMBER)
@@ -148,6 +183,7 @@ int ksmbd_verify_smb_message(struct ksmbd_work *work)
 	}
 
 	return -EINVAL;
+#endif
 }
 
 /**
@@ -299,6 +335,7 @@ err_out:
 	return BAD_PROT_ID;
 }
 
+#ifndef CONFIG_SMB_INSECURE_SERVER
 #define SMB_COM_NEGOTIATE_EX	0x0
 
 /**
@@ -358,7 +395,7 @@ static int smb1_check_user_session(struct ksmbd_work *work)
 static int smb1_allocate_rsp_buf(struct ksmbd_work *work)
 {
 	work->response_buf = kzalloc(MAX_CIFS_SMALL_BUFFER_SIZE,
-			GFP_KERNEL);
+			KSMBD_DEFAULT_GFP);
 	work->response_sz = MAX_CIFS_SMALL_BUFFER_SIZE;
 
 	if (!work->response_buf) {
@@ -388,6 +425,10 @@ static struct smb_version_ops smb1_server_ops = {
 	.set_rsp_status = set_smb1_rsp_status,
 };
 
+static struct smb_version_values smb1_server_values = {
+	.max_credits = SMB2_MAX_CREDITS,
+};
+
 static int smb1_negotiate(struct ksmbd_work *work)
 {
 	return ksmbd_smb_negotiate_common(work, SMB_COM_NEGOTIATE);
@@ -399,18 +440,19 @@ static struct smb_version_cmds smb1_server_cmds[1] = {
 
 static int init_smb1_server(struct ksmbd_conn *conn)
 {
+	conn->vals = &smb1_server_values;
 	conn->ops = &smb1_server_ops;
 	conn->cmds = smb1_server_cmds;
 	conn->max_cmds = ARRAY_SIZE(smb1_server_cmds);
 	return 0;
 }
+#endif
 
-int ksmbd_init_smb_server(struct ksmbd_work *work)
+int ksmbd_init_smb_server(struct ksmbd_conn *conn)
 {
-	struct ksmbd_conn *conn = work->conn;
 	__le32 proto;
 
-	proto = *(__le32 *)((struct smb_hdr *)work->request_buf)->Protocol;
+	proto = *(__le32 *)((struct smb_hdr *)conn->request_buf)->Protocol;
 	if (conn->need_neg == false) {
 		if (proto == SMB1_PROTO_NUMBER)
 			return -EINVAL;
@@ -432,7 +474,11 @@ int ksmbd_populate_dot_dotdot_entries(struct ksmbd_work *work, int info_level,
 {
 	int i, rc = 0;
 	struct ksmbd_conn *conn = work->conn;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	struct mnt_idmap *idmap = file_mnt_idmap(dir->filp);
+#else
 	struct user_namespace *user_ns = file_mnt_user_ns(dir->filp);
+#endif
 
 	for (i = 0; i < 2; i++) {
 		struct kstat kstat;
@@ -458,7 +504,11 @@ int ksmbd_populate_dot_dotdot_entries(struct ksmbd_work *work, int info_level,
 
 			ksmbd_kstat.kstat = &kstat;
 			ksmbd_vfs_fill_dentry_attrs(work,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+						    idmap,
+#else
 						    user_ns,
+#endif
 						    dentry,
 						    &ksmbd_kstat);
 			rc = fn(conn, info_level, d_info, &ksmbd_kstat);
@@ -485,7 +535,7 @@ int ksmbd_populate_dot_dotdot_entries(struct ksmbd_work *work, int info_level,
  * @shortname:	destination short filename
  *
  * Return:	shortname length or 0 when source long name is '.' or '..'
- * TODO: Though this function comforms the restriction of 8.3 Filename spec,
+ * TODO: Though this function conforms the restriction of 8.3 Filename spec,
  * but the result is different with Windows 7's one. need to check.
  */
 int ksmbd_extract_shortname(struct ksmbd_conn *conn, const char *longname,
@@ -563,14 +613,15 @@ static int __smb2_negotiate(struct ksmbd_conn *conn)
 		conn->dialect <= SMB311_PROT_ID);
 }
 
+#ifndef CONFIG_SMB_INSECURE_SERVER
 static int smb_handle_negotiate(struct ksmbd_work *work)
 {
 	struct smb_negotiate_rsp *neg_rsp = work->response_buf;
 
 	ksmbd_debug(SMB, "Unsupported SMB1 protocol\n");
 
-	if (ksmbd_iov_pin_rsp(work, (void *)neg_rsp,
-			      sizeof(struct smb_negotiate_rsp) - 4))
+	if (ksmbd_iov_pin_rsp(work, (void *)neg_rsp + 4,
+			      sizeof(struct smb_negotiate_unsupported_rsp) - 4))
 		return -ENOMEM;
 
 	neg_rsp->hdr.Status.CifsError = STATUS_SUCCESS;
@@ -579,6 +630,7 @@ static int smb_handle_negotiate(struct ksmbd_work *work)
 	neg_rsp->ByteCount = 0;
 	return 0;
 }
+#endif
 
 int ksmbd_smb_negotiate_common(struct ksmbd_work *work, unsigned int command)
 {
@@ -643,7 +695,7 @@ int ksmbd_smb_check_shared_mode(struct file *filp, struct ksmbd_file *curr_fp)
 	 * Lookup fp in master fp list, and check desired access and
 	 * shared mode between previous open and current open.
 	 */
-	read_lock(&curr_fp->f_ci->m_lock);
+	down_read(&curr_fp->f_ci->m_lock);
 	list_for_each_entry(prev_fp, &curr_fp->f_ci->m_fp_list, node) {
 		if (file_inode(filp) != file_inode(prev_fp->filp))
 			continue;
@@ -719,7 +771,7 @@ int ksmbd_smb_check_shared_mode(struct file *filp, struct ksmbd_file *curr_fp)
 			break;
 		}
 	}
-	read_unlock(&curr_fp->f_ci->m_lock);
+	up_read(&curr_fp->f_ci->m_lock);
 
 	return rc;
 }
@@ -733,30 +785,39 @@ int __ksmbd_override_fsids(struct ksmbd_work *work,
 		struct ksmbd_share_config *share)
 {
 	struct ksmbd_session *sess = work->sess;
+	struct ksmbd_user *user = sess->user;
 	struct cred *cred;
 	struct group_info *gi;
 	unsigned int uid;
 	unsigned int gid;
+	int i;
 
-	uid = user_uid(sess->user);
-	gid = user_gid(sess->user);
+	uid = user_uid(user);
+	gid = user_gid(user);
 	if (share->force_uid != KSMBD_SHARE_INVALID_UID)
 		uid = share->force_uid;
 	if (share->force_gid != KSMBD_SHARE_INVALID_GID)
 		gid = share->force_gid;
 
-	cred = prepare_kernel_cred(NULL);
+	cred = prepare_kernel_cred(&init_task);
 	if (!cred)
 		return -ENOMEM;
 
 	cred->fsuid = make_kuid(&init_user_ns, uid);
 	cred->fsgid = make_kgid(&init_user_ns, gid);
 
-	gi = groups_alloc(0);
+	gi = groups_alloc(user->ngroups);
 	if (!gi) {
 		abort_creds(cred);
 		return -ENOMEM;
 	}
+
+	for (i = 0; i < user->ngroups; i++)
+		gi->gid[i] = make_kgid(&init_user_ns, user->sgid[i]);
+
+	if (user->ngroups)
+		groups_sort(gi);
+
 	set_groups(cred, gi);
 	put_group_info(gi);
 

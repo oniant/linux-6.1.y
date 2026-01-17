@@ -18,7 +18,7 @@ static int try_to_realloc_ndr_blob(struct ndr *n, size_t sz)
 {
 	char *data;
 
-	data = krealloc(n->data, n->offset + sz + 1024, GFP_KERNEL);
+	data = krealloc(n->data, n->offset + sz + 1024, KSMBD_DEFAULT_GFP);
 	if (!data)
 		return -ENOMEM;
 
@@ -174,7 +174,7 @@ int ndr_encode_dos_attr(struct ndr *n, struct xattr_dos_attrib *da)
 
 	n->offset = 0;
 	n->length = 1024;
-	n->data = kzalloc(n->length, GFP_KERNEL);
+	n->data = kzalloc(n->length, KSMBD_DEFAULT_GFP);
 	if (!n->data)
 		return -ENOMEM;
 
@@ -229,8 +229,7 @@ int ndr_encode_dos_attr(struct ndr *n, struct xattr_dos_attrib *da)
 int ndr_decode_dos_attr(struct ndr *n, struct xattr_dos_attrib *da)
 {
 	char hex_attr[12];
-	unsigned int version2;
-	int ret;
+	unsigned int version2, ret;
 
 	n->offset = 0;
 	ret = ndr_read_string(n, hex_attr, sizeof(hex_attr));
@@ -338,19 +337,25 @@ static int ndr_encode_posix_acl_entry(struct ndr *n, struct xattr_smb_acl *acl)
 }
 
 int ndr_encode_posix_acl(struct ndr *n,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+			 struct mnt_idmap *idmap,
+#else
 			 struct user_namespace *user_ns,
+#endif
 			 struct inode *inode,
 			 struct xattr_smb_acl *acl,
 			 struct xattr_smb_acl *def_acl)
 {
 	unsigned int ref_id = 0x00020000;
 	int ret;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
 	vfsuid_t vfsuid;
 	vfsgid_t vfsgid;
+#endif
 
 	n->offset = 0;
 	n->length = 1024;
-	n->data = kzalloc(n->length, GFP_KERNEL);
+	n->data = kzalloc(n->length, KSMBD_DEFAULT_GFP);
 	if (!n->data)
 		return -ENOMEM;
 
@@ -374,14 +379,41 @@ int ndr_encode_posix_acl(struct ndr *n,
 	if (ret)
 		return ret;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	vfsuid = i_uid_into_vfsuid(idmap, inode);
+#else
 	vfsuid = i_uid_into_vfsuid(user_ns, inode);
+#endif
 	ret = ndr_write_int64(n, from_kuid(&init_user_ns, vfsuid_into_kuid(vfsuid)));
+#else
+	ret = ndr_write_int64(n, from_kuid(&init_user_ns, i_uid_into_mnt(user_ns, inode)));
+#endif
 	if (ret)
 		return ret;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	vfsgid = i_gid_into_vfsgid(idmap, inode);
+#else
 	vfsgid = i_gid_into_vfsgid(user_ns, inode);
+#endif
 	ret = ndr_write_int64(n, from_kgid(&init_user_ns, vfsgid_into_kgid(vfsgid)));
+#else
+	ret = ndr_write_int64(n, from_kgid(&init_user_ns, i_gid_into_mnt(user_ns, inode)));
+#endif
 	if (ret)
 		return ret;
+#else
+	ret = ndr_write_int64(n, from_kuid(&init_user_ns, inode->i_uid));
+	if (ret)
+		return ret;
+
+	ret = ndr_write_int64(n, from_kgid(&init_user_ns, inode->i_gid));
+	if (ret)
+		return ret;
+#endif
 	ret = ndr_write_int32(n, inode->i_mode);
 	if (ret)
 		return ret;
@@ -401,7 +433,7 @@ int ndr_encode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl)
 
 	n->offset = 0;
 	n->length = 2048;
-	n->data = kzalloc(n->length, GFP_KERNEL);
+	n->data = kzalloc(n->length, KSMBD_DEFAULT_GFP);
 	if (!n->data)
 		return -ENOMEM;
 
@@ -505,7 +537,7 @@ int ndr_decode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl)
 		return ret;
 
 	acl->sd_size = n->length - n->offset;
-	acl->sd_buf = kzalloc(acl->sd_size, GFP_KERNEL);
+	acl->sd_buf = kzalloc(acl->sd_size, KSMBD_DEFAULT_GFP);
 	if (!acl->sd_buf)
 		return -ENOMEM;
 

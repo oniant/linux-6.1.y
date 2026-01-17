@@ -152,20 +152,17 @@ struct smb_direct_transport {
 	struct work_struct	disconnect_work;
 
 	bool			negotiation_requested;
-
-	bool			legacy_iwarp;
-	u8			initiator_depth;
-	u8			responder_resources;
 };
 
 #define KSMBD_TRANS(t) ((struct ksmbd_transport *)&((t)->transport))
-
+#define SMBD_TRANS(t)	((struct smb_direct_transport *)container_of(t, \
+				struct smb_direct_transport, transport))
 enum {
 	SMB_DIRECT_MSG_NEGOTIATE_REQ = 0,
 	SMB_DIRECT_MSG_DATA_TRANSFER
 };
 
-static struct ksmbd_transport_ops ksmbd_smb_direct_transport_ops;
+static const struct ksmbd_transport_ops ksmbd_smb_direct_transport_ops;
 
 struct smb_direct_send_ctx {
 	struct list_head	msg_list;
@@ -218,8 +215,8 @@ unsigned int get_smbd_max_read_write_size(void)
 
 static inline int get_buf_page_count(void *buf, int size)
 {
-	return DIV_ROUND_UP((uintptr_t)buf + size, PAGE_SIZE) -
-		(uintptr_t)buf / PAGE_SIZE;
+	return (int)(DIV_ROUND_UP((uintptr_t)buf + size, PAGE_SIZE) -
+		     (uintptr_t)buf / PAGE_SIZE);
 }
 
 static void smb_direct_destroy_pools(struct smb_direct_transport *transport);
@@ -342,15 +339,12 @@ static struct smb_direct_transport *alloc_transport(struct rdma_cm_id *cm_id)
 	struct smb_direct_transport *t;
 	struct ksmbd_conn *conn;
 
-	t = kzalloc(sizeof(*t), GFP_KERNEL);
+	t = kzalloc(sizeof(*t), KSMBD_DEFAULT_GFP);
 	if (!t)
 		return NULL;
 
 	t->cm_id = cm_id;
 	cm_id->context = t;
-
-	t->initiator_depth = SMB_DIRECT_CM_INITIATOR_DEPTH;
-	t->responder_resources = 1;
 
 	t->status = SMB_DIRECT_CS_NEW;
 	init_waitqueue_head(&t->wait_status);
@@ -380,6 +374,11 @@ static struct smb_direct_transport *alloc_transport(struct rdma_cm_id *cm_id)
 	conn = ksmbd_conn_alloc();
 	if (!conn)
 		goto err;
+
+	down_write(&conn_list_lock);
+	hash_add(conn_list, &conn->hlist, 0);
+	up_write(&conn_list_lock);
+
 	conn->transport = KSMBD_TRANS(t);
 	KSMBD_TRANS(t)->conn = conn;
 	KSMBD_TRANS(t)->ops = &ksmbd_smb_direct_transport_ops;
@@ -387,6 +386,11 @@ static struct smb_direct_transport *alloc_transport(struct rdma_cm_id *cm_id)
 err:
 	kfree(t);
 	return NULL;
+}
+
+static void smb_direct_free_transport(struct ksmbd_transport *kt)
+{
+	kfree(SMBD_TRANS(kt));
 }
 
 static void free_transport(struct smb_direct_transport *t)
@@ -399,9 +403,9 @@ static void free_transport(struct smb_direct_transport *t)
 	wait_event(t->wait_send_pending,
 		   atomic_read(&t->send_pending) == 0);
 
-	cancel_work_sync(&t->disconnect_work);
-	cancel_work_sync(&t->post_recv_credits_work);
-	cancel_work_sync(&t->send_immediate_work);
+	disable_work_sync(&t->disconnect_work);
+	disable_work_sync(&t->post_recv_credits_work);
+	disable_work_sync(&t->send_immediate_work);
 
 	if (t->qp) {
 		ib_drain_qp(t->qp);
@@ -435,7 +439,6 @@ static void free_transport(struct smb_direct_transport *t)
 
 	smb_direct_destroy_pools(t);
 	ksmbd_conn_free(KSMBD_TRANS(t)->conn);
-	kfree(t);
 }
 
 static struct smb_direct_sendmsg
@@ -443,7 +446,7 @@ static struct smb_direct_sendmsg
 {
 	struct smb_direct_sendmsg *msg;
 
-	msg = mempool_alloc(t->sendmsg_mempool, GFP_KERNEL);
+	msg = mempool_alloc(t->sendmsg_mempool, KSMBD_DEFAULT_GFP);
 	if (!msg)
 		return ERR_PTR(-ENOMEM);
 	msg->transport = t;
@@ -933,15 +936,12 @@ static int smb_direct_flush_send_list(struct smb_direct_transport *t,
 			       struct smb_direct_sendmsg,
 			       list);
 
-	if (send_ctx->need_invalidate_rkey) {
-		first->wr.opcode = IB_WR_SEND_WITH_INV;
-		first->wr.ex.invalidate_rkey = send_ctx->remote_key;
-		send_ctx->need_invalidate_rkey = false;
-		send_ctx->remote_key = 0;
-	}
-
 	last->wr.send_flags = IB_SEND_SIGNALED;
 	last->wr.wr_cqe = &last->cqe;
+	if (is_last && send_ctx->need_invalidate_rkey) {
+		last->wr.opcode = IB_WR_SEND_WITH_INV;
+		last->wr.ex.invalidate_rkey = send_ctx->remote_key;
+	}
 
 	ret = smb_direct_post_send(t, &first->wr);
 	if (!ret) {
@@ -1221,78 +1221,130 @@ static int smb_direct_writev(struct ksmbd_transport *t,
 			     bool need_invalidate, unsigned int remote_key)
 {
 	struct smb_direct_transport *st = smb_trans_direct_transfort(t);
-	int remaining_data_length;
-	int start, i, j;
-	int max_iov_size = st->max_send_size -
+	size_t remaining_data_length;
+	size_t iov_idx;
+	size_t iov_ofs;
+	size_t max_iov_size = st->max_send_size -
 			sizeof(struct smb_direct_data_transfer);
 	int ret;
-	struct kvec vec;
 	struct smb_direct_send_ctx send_ctx;
+	int error = 0;
 
 	if (st->status != SMB_DIRECT_CS_CONNECTED)
 		return -ENOTCONN;
 
 	//FIXME: skip RFC1002 header..
+	if (WARN_ON_ONCE(niovs <= 1 || iov[0].iov_len != 4))
+		return -EINVAL;
 	buflen -= 4;
+	iov_idx = 1;
+	iov_ofs = 0;
 
 	remaining_data_length = buflen;
 	ksmbd_debug(RDMA, "Sending smb (RDMA): smb_len=%u\n", buflen);
 
 	smb_direct_send_ctx_init(st, &send_ctx, need_invalidate, remote_key);
-	start = i = 1;
-	buflen = 0;
-	while (true) {
-		buflen += iov[i].iov_len;
-		if (buflen > max_iov_size) {
-			if (i > start) {
-				remaining_data_length -=
-					(buflen - iov[i].iov_len);
-				ret = smb_direct_post_send_data(st, &send_ctx,
-								&iov[start], i - start,
-								remaining_data_length);
-				if (ret)
-					goto done;
-			} else {
-				/* iov[start] is too big, break it */
-				int nvec  = (buflen + max_iov_size - 1) /
-						max_iov_size;
+	while (remaining_data_length) {
+		struct kvec vecs[SMB_DIRECT_MAX_SEND_SGES - 1]; /* minus smbdirect hdr */
+		size_t possible_bytes = max_iov_size;
+		size_t possible_vecs;
+		size_t bytes = 0;
+		size_t nvecs = 0;
 
-				for (j = 0; j < nvec; j++) {
-					vec.iov_base =
-						(char *)iov[start].iov_base +
-						j * max_iov_size;
-					vec.iov_len =
-						min_t(int, max_iov_size,
-						      buflen - max_iov_size * j);
-					remaining_data_length -= vec.iov_len;
-					ret = smb_direct_post_send_data(st, &send_ctx, &vec, 1,
-									remaining_data_length);
-					if (ret)
-						goto done;
-				}
-				i++;
-				if (i == niovs)
-					break;
-			}
-			start = i;
-			buflen = 0;
-		} else {
-			i++;
-			if (i == niovs) {
-				/* send out all remaining vecs */
-				remaining_data_length -= buflen;
-				ret = smb_direct_post_send_data(st, &send_ctx,
-								&iov[start], i - start,
-								remaining_data_length);
-				if (ret)
+		/*
+		 * For the last message remaining_data_length should be
+		 * have been 0 already!
+		 */
+		if (WARN_ON_ONCE(iov_idx >= niovs)) {
+			error = -EINVAL;
+			goto done;
+		}
+
+		/*
+		 * We have 2 factors which limit the arguments we pass
+		 * to smb_direct_post_send_data():
+		 *
+		 * 1. The number of supported sges for the send,
+		 *    while one is reserved for the smbdirect header.
+		 *    And we currently need one SGE per page.
+		 * 2. The number of negotiated payload bytes per send.
+		 */
+		possible_vecs = min_t(size_t, ARRAY_SIZE(vecs), niovs - iov_idx);
+
+		while (iov_idx < niovs && possible_vecs && possible_bytes) {
+			struct kvec *v = &vecs[nvecs];
+			int page_count;
+
+			v->iov_base = ((u8 *)iov[iov_idx].iov_base) + iov_ofs;
+			v->iov_len = min_t(size_t,
+					   iov[iov_idx].iov_len - iov_ofs,
+					   possible_bytes);
+			page_count = get_buf_page_count(v->iov_base, v->iov_len);
+			if (page_count > possible_vecs) {
+				/*
+				 * If the number of pages in the buffer
+				 * is to much (because we currently require
+				 * one SGE per page), we need to limit the
+				 * length.
+				 *
+				 * We know possible_vecs is at least 1,
+				 * so we always keep the first page.
+				 *
+				 * We need to calculate the number extra
+				 * pages (epages) we can also keep.
+				 *
+				 * We calculate the number of bytes in the
+				 * first page (fplen), this should never be
+				 * larger than v->iov_len because page_count is
+				 * at least 2, but adding a limitation feels
+				 * better.
+				 *
+				 * Then we calculate the number of bytes (elen)
+				 * we can keep for the extra pages.
+				 */
+				size_t epages = possible_vecs - 1;
+				size_t fpofs = offset_in_page(v->iov_base);
+				size_t fplen = min_t(size_t, PAGE_SIZE - fpofs, v->iov_len);
+				size_t elen = min_t(size_t, v->iov_len - fplen, epages*PAGE_SIZE);
+
+				v->iov_len = fplen + elen;
+				page_count = get_buf_page_count(v->iov_base, v->iov_len);
+				if (WARN_ON_ONCE(page_count > possible_vecs)) {
+					/*
+					 * Something went wrong in the above
+					 * logic...
+					 */
+					error = -EINVAL;
 					goto done;
-				break;
+				}
 			}
+			possible_vecs -= page_count;
+			nvecs += 1;
+			possible_bytes -= v->iov_len;
+			bytes += v->iov_len;
+
+			iov_ofs += v->iov_len;
+			if (iov_ofs >= iov[iov_idx].iov_len) {
+				iov_idx += 1;
+				iov_ofs = 0;
+			}
+		}
+
+		remaining_data_length -= bytes;
+
+		ret = smb_direct_post_send_data(st, &send_ctx,
+						vecs, nvecs,
+						remaining_data_length);
+		if (unlikely(ret)) {
+			error = ret;
+			goto done;
 		}
 	}
 
 done:
 	ret = smb_direct_flush_send_list(st, &send_ctx, true);
+	if (unlikely(!ret && error))
+		ret = error;
 
 	/*
 	 * As an optimization, we don't wait for individual I/O to finish
@@ -1398,8 +1450,8 @@ static int smb_direct_rdma_xmit(struct smb_direct_transport *t,
 	/* build rdma_rw_ctx for each descriptor */
 	desc_buf = buf;
 	for (i = 0; i < desc_num; i++) {
-		msg = kzalloc(offsetof(struct smb_direct_rdma_rw_msg, sg_list) +
-			      sizeof(struct scatterlist) * SG_CHUNK_SIZE, GFP_KERNEL);
+		msg = kzalloc(struct_size(msg, sg_list, SG_CHUNK_SIZE),
+			      KSMBD_DEFAULT_GFP);
 		if (!msg) {
 			ret = -ENOMEM;
 			goto out;
@@ -1628,21 +1680,21 @@ static int smb_direct_send_negotiate_response(struct smb_direct_transport *t,
 static int smb_direct_accept_client(struct smb_direct_transport *t)
 {
 	struct rdma_conn_param conn_param;
-	__be32 ird_ord_hdr[2];
+	struct ib_port_immutable port_immutable;
+	u32 ird_ord_hdr[2];
 	int ret;
 
-	/*
-	 * smb_direct_handle_connect_request()
-	 * already negotiated t->initiator_depth
-	 * and t->responder_resources
-	 */
 	memset(&conn_param, 0, sizeof(conn_param));
-	conn_param.initiator_depth = t->initiator_depth;
-	conn_param.responder_resources = t->responder_resources;
+	conn_param.initiator_depth = min_t(u8, t->cm_id->device->attrs.max_qp_rd_atom,
+					   SMB_DIRECT_CM_INITIATOR_DEPTH);
+	conn_param.responder_resources = 0;
 
-	if (t->legacy_iwarp) {
-		ird_ord_hdr[0] = cpu_to_be32(conn_param.responder_resources);
-		ird_ord_hdr[1] = cpu_to_be32(conn_param.initiator_depth);
+	t->cm_id->device->ops.get_port_immutable(t->cm_id->device,
+						 t->cm_id->port_num,
+						 &port_immutable);
+	if (port_immutable.core_cap_flags & RDMA_CORE_PORT_IWARP) {
+		ird_ord_hdr[0] = conn_param.responder_resources;
+		ird_ord_hdr[1] = 1;
 		conn_param.private_data = ird_ord_hdr;
 		conn_param.private_data_len = sizeof(ird_ord_hdr);
 	} else {
@@ -1756,6 +1808,11 @@ static int smb_direct_init_params(struct smb_direct_transport *t,
 		return -EINVAL;
 	}
 
+	if (device->attrs.max_send_sge < SMB_DIRECT_MAX_SEND_SGES) {
+		pr_err("warning: device max_send_sge = %d too small\n",
+		       device->attrs.max_send_sge);
+		return -EINVAL;
+	}
 	if (device->attrs.max_recv_sge < SMB_DIRECT_MAX_RECV_SGES) {
 		pr_err("warning: device max_recv_sge = %d too small\n",
 		       device->attrs.max_recv_sge);
@@ -1779,7 +1836,7 @@ static int smb_direct_init_params(struct smb_direct_transport *t,
 
 	cap->max_send_wr = max_send_wrs;
 	cap->max_recv_wr = t->recv_credit_max;
-	cap->max_send_sge = max_sge_per_wr;
+	cap->max_send_sge = SMB_DIRECT_MAX_SEND_SGES;
 	cap->max_recv_sge = SMB_DIRECT_MAX_RECV_SGES;
 	cap->max_inline_data = 0;
 	cap->max_rdma_ctxs = t->max_rw_credits;
@@ -1843,7 +1900,7 @@ static int smb_direct_create_pools(struct smb_direct_transport *t)
 	INIT_LIST_HEAD(&t->recvmsg_queue);
 
 	for (i = 0; i < t->recv_credit_max; i++) {
-		recvmsg = mempool_alloc(t->recvmsg_mempool, GFP_KERNEL);
+		recvmsg = mempool_alloc(t->recvmsg_mempool, KSMBD_DEFAULT_GFP);
 		if (!recvmsg)
 			goto err;
 		recvmsg->transport = t;
@@ -1863,7 +1920,9 @@ static int smb_direct_create_qpair(struct smb_direct_transport *t,
 {
 	int ret;
 	struct ib_qp_init_attr qp_attr;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)
 	int pages_per_rw;
+#endif
 
 	t->pd = ib_alloc_pd(t->cm_id->device, 0);
 	if (IS_ERR(t->pd)) {
@@ -1911,8 +1970,10 @@ static int smb_direct_create_qpair(struct smb_direct_transport *t,
 	t->qp = t->cm_id->qp;
 	t->cm_id->event_handler = smb_direct_cm_handler;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)
 	pages_per_rw = DIV_ROUND_UP(t->max_rdma_rw_size, PAGE_SIZE) + 1;
 	if (pages_per_rw > t->cm_id->device->attrs.max_sgl_rd) {
+#endif
 		ret = ib_mr_pool_init(t->qp, &t->qp->rdma_mrs,
 				      t->max_rw_credits, IB_MR_TYPE_MEM_REG,
 				      t->pages_per_rw_credit, 0);
@@ -1921,8 +1982,9 @@ static int smb_direct_create_qpair(struct smb_direct_transport *t,
 			       t->max_rw_credits, t->pages_per_rw_credit);
 			goto err;
 		}
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)
 	}
-
+#endif
 	return 0;
 err:
 	if (t->qp) {
@@ -2028,13 +2090,10 @@ static bool rdma_frwr_is_supported(struct ib_device_attr *attrs)
 	return true;
 }
 
-static int smb_direct_handle_connect_request(struct rdma_cm_id *new_cm_id,
-					     struct rdma_cm_event *event)
+static int smb_direct_handle_connect_request(struct rdma_cm_id *new_cm_id)
 {
 	struct smb_direct_transport *t;
 	struct task_struct *handler;
-	u8 peer_initiator_depth;
-	u8 peer_responder_resources;
 	int ret;
 
 	if (!rdma_frwr_is_supported(&new_cm_id->device->attrs)) {
@@ -2047,67 +2106,6 @@ static int smb_direct_handle_connect_request(struct rdma_cm_id *new_cm_id,
 	t = alloc_transport(new_cm_id);
 	if (!t)
 		return -ENOMEM;
-
-	peer_initiator_depth = event->param.conn.initiator_depth;
-	peer_responder_resources = event->param.conn.responder_resources;
-	if (rdma_protocol_iwarp(new_cm_id->device, new_cm_id->port_num) &&
-	    event->param.conn.private_data_len == 8) {
-		/*
-		 * Legacy clients with only iWarp MPA v1 support
-		 * need a private blob in order to negotiate
-		 * the IRD/ORD values.
-		 */
-		const __be32 *ird_ord_hdr = event->param.conn.private_data;
-		u32 ird32 = be32_to_cpu(ird_ord_hdr[0]);
-		u32 ord32 = be32_to_cpu(ird_ord_hdr[1]);
-
-		/*
-		 * cifs.ko sends the legacy IRD/ORD negotiation
-		 * event if iWarp MPA v2 was used.
-		 *
-		 * Here we check that the values match and only
-		 * mark the client as legacy if they don't match.
-		 */
-		if ((u32)event->param.conn.initiator_depth != ird32 ||
-		    (u32)event->param.conn.responder_resources != ord32) {
-			/*
-			 * There are broken clients (old cifs.ko)
-			 * using little endian and also
-			 * struct rdma_conn_param only uses u8
-			 * for initiator_depth and responder_resources,
-			 * so we truncate the value to U8_MAX.
-			 *
-			 * smb_direct_accept_client() will then
-			 * do the real negotiation in order to
-			 * select the minimum between client and
-			 * server.
-			 */
-			ird32 = min_t(u32, ird32, U8_MAX);
-			ord32 = min_t(u32, ord32, U8_MAX);
-
-			t->legacy_iwarp = true;
-			peer_initiator_depth = (u8)ird32;
-			peer_responder_resources = (u8)ord32;
-		}
-	}
-
-	/*
-	 * First set what the we as server are able to support
-	 */
-	t->initiator_depth = min_t(u8, t->initiator_depth,
-				   new_cm_id->device->attrs.max_qp_rd_atom);
-
-	/*
-	 * negotiate the value by using the minimum
-	 * between client and server if the client provided
-	 * non 0 values.
-	 */
-	if (peer_initiator_depth != 0)
-		t->initiator_depth = min_t(u8, t->initiator_depth,
-					   peer_initiator_depth);
-	if (peer_responder_resources != 0)
-		t->responder_resources = min_t(u8, t->responder_resources,
-					       peer_responder_resources);
 
 	ret = smb_direct_connect(t);
 	if (ret)
@@ -2133,7 +2131,7 @@ static int smb_direct_listen_handler(struct rdma_cm_id *cm_id,
 {
 	switch (event->event) {
 	case RDMA_CM_EVENT_CONNECT_REQUEST: {
-		int ret = smb_direct_handle_connect_request(cm_id, event);
+		int ret = smb_direct_handle_connect_request(cm_id);
 
 		if (ret) {
 			pr_err("Can't create transport: %d\n", ret);
@@ -2189,7 +2187,11 @@ err:
 	return ret;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 static int smb_direct_ib_client_add(struct ib_device *ib_dev)
+#else
+static void smb_direct_ib_client_add(struct ib_device *ib_dev)
+#endif
 {
 	struct smb_direct_device *smb_dev;
 
@@ -2197,12 +2199,21 @@ static int smb_direct_ib_client_add(struct ib_device *ib_dev)
 	if (ib_dev->node_type != RDMA_NODE_IB_CA)
 		smb_direct_port = SMB_DIRECT_PORT_IWARP;
 
-	if (!rdma_frwr_is_supported(&ib_dev->attrs))
+	if (!ib_dev->ops.get_netdev ||
+	    !rdma_frwr_is_supported(&ib_dev->attrs))
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 		return 0;
+#else
+		return;
+#endif
 
-	smb_dev = kzalloc(sizeof(*smb_dev), GFP_KERNEL);
+	smb_dev = kzalloc(sizeof(*smb_dev), KSMBD_DEFAULT_GFP);
 	if (!smb_dev)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 		return -ENOMEM;
+#else
+		return;
+#endif
 	smb_dev->ib_dev = ib_dev;
 
 	write_lock(&smb_direct_device_lock);
@@ -2210,7 +2221,11 @@ static int smb_direct_ib_client_add(struct ib_device *ib_dev)
 	write_unlock(&smb_direct_device_lock);
 
 	ksmbd_debug(RDMA, "ib device added: name %s\n", ib_dev->name);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 	return 0;
+#else
+	return;
+#endif
 }
 
 static void smb_direct_ib_client_remove(struct ib_device *ib_dev,
@@ -2252,8 +2267,14 @@ int ksmbd_rdma_init(void)
 	 * This avoids the situation that a clients cannot send packets
 	 * for lack of credits
 	 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+	smb_direct_wq = alloc_workqueue("ksmbd-smb_direct-wq",
+					WQ_HIGHPRI | WQ_MEM_RECLAIM | WQ_PERCPU,
+					0);
+#else
 	smb_direct_wq = alloc_workqueue("ksmbd-smb_direct-wq",
 					WQ_HIGHPRI | WQ_MEM_RECLAIM, 0);
+#endif
 	if (!smb_direct_wq)
 		return -ENOMEM;
 
@@ -2289,7 +2310,7 @@ void ksmbd_rdma_destroy(void)
 	}
 }
 
-bool ksmbd_rdma_capable_netdev(struct net_device *netdev)
+static bool ksmbd_find_rdma_capable_netdev(struct net_device *netdev)
 {
 	struct smb_direct_device *smb_dev;
 	int i;
@@ -2300,38 +2321,17 @@ bool ksmbd_rdma_capable_netdev(struct net_device *netdev)
 		for (i = 0; i < smb_dev->ib_dev->phys_port_cnt; i++) {
 			struct net_device *ndev;
 
-			if (smb_dev->ib_dev->ops.get_netdev) {
-				ndev = smb_dev->ib_dev->ops.get_netdev(
-					smb_dev->ib_dev, i + 1);
-				if (!ndev)
-					continue;
+			ndev = smb_dev->ib_dev->ops.get_netdev(smb_dev->ib_dev,
+							       i + 1);
+			if (!ndev)
+				continue;
 
-				if (ndev == netdev) {
-					dev_put(ndev);
-					rdma_capable = true;
-					goto out;
-				}
+			if (ndev == netdev) {
 				dev_put(ndev);
-			/* if ib_dev does not implement ops.get_netdev
-			 * check for matching infiniband GUID in hw_addr
-			 */
-			} else if (netdev->type == ARPHRD_INFINIBAND) {
-				struct netdev_hw_addr *ha;
-				union ib_gid gid;
-				u32 port_num;
-				int ret;
-
-				netdev_hw_addr_list_for_each(
-					ha, &netdev->dev_addrs) {
-					memcpy(&gid, ha->addr + 4, sizeof(gid));
-					ret = ib_find_gid(smb_dev->ib_dev, &gid,
-							  &port_num, NULL);
-					if (!ret) {
-						rdma_capable = true;
-						goto out;
-					}
-				}
+				rdma_capable = true;
+				goto out;
 			}
+			dev_put(ndev);
 		}
 	}
 out:
@@ -2342,16 +2342,40 @@ out:
 
 		ibdev = ib_device_get_by_netdev(netdev, RDMA_DRIVER_UNKNOWN);
 		if (ibdev) {
-			if (rdma_frwr_is_supported(&ibdev->attrs))
-				rdma_capable = true;
+			rdma_capable = rdma_frwr_is_supported(&ibdev->attrs);
 			ib_device_put(ibdev);
 		}
 	}
 
+	ksmbd_debug(RDMA, "netdev(%s) rdma capable : %s\n",
+		    netdev->name, rdma_capable ? "true" : "false");
+
 	return rdma_capable;
 }
 
-static struct ksmbd_transport_ops ksmbd_smb_direct_transport_ops = {
+bool ksmbd_rdma_capable_netdev(struct net_device *netdev)
+{
+        struct net_device *lower_dev;
+        struct list_head *iter;
+
+        if (ksmbd_find_rdma_capable_netdev(netdev))
+                return true;
+
+        /* check if netdev is bridge or VLAN */
+        if (netif_is_bridge_master(netdev) ||
+            netdev->priv_flags & IFF_802_1Q_VLAN)
+                netdev_for_each_lower_dev(netdev, lower_dev, iter)
+                        if (ksmbd_find_rdma_capable_netdev(lower_dev))
+                                return true;
+
+	/* check if netdev is IPoIB safely without layer violation */
+	if (netdev->type == ARPHRD_INFINIBAND)
+		return true;
+
+	return false;
+}
+
+static const struct ksmbd_transport_ops ksmbd_smb_direct_transport_ops = {
 	.prepare	= smb_direct_prepare,
 	.disconnect	= smb_direct_disconnect,
 	.shutdown	= smb_direct_shutdown,
@@ -2359,4 +2383,5 @@ static struct ksmbd_transport_ops ksmbd_smb_direct_transport_ops = {
 	.read		= smb_direct_read,
 	.rdma_read	= smb_direct_rdma_read,
 	.rdma_write	= smb_direct_rdma_write,
+	.free_transport = smb_direct_free_transport,
 };

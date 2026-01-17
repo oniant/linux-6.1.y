@@ -89,7 +89,15 @@ struct ksmbd_work {
 	/* List head at conn->async_requests */
 	struct list_head                async_request_entry;
 	struct list_head                fp_entry;
-	struct list_head                interim_entry;
+
+#ifdef CONFIG_SMB_INSECURE_SERVER
+	/* Read data buffer */
+	void                            *aux_payload_buf;
+	/* Read data count */
+	unsigned int                    aux_payload_sz;
+	/* response smb header size */
+	unsigned int                    resp_hdr_sz;
+#endif
 };
 
 /**
