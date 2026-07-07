@@ -10,7 +10,6 @@
 
 #include "glob.h"
 #include "nterr.h"
-#include "../common/smb2pdu.h"
 #include "smb2pdu.h"
 
 /* ksmbd's Specific ERRNO */
@@ -33,12 +32,26 @@
 #define SMB302_VERSION_STRING	"3.02"
 #define SMB311_VERSION_STRING	"3.1.1"
 
+/* Dialects */
+#define SMB10_PROT_ID		0x00
+#define SMB20_PROT_ID		0x0202
+#define SMB21_PROT_ID		0x0210
+/* multi-protocol negotiate request */
+#define SMB2X_PROT_ID		0x02FF
+#define SMB30_PROT_ID		0x0300
+#define SMB302_PROT_ID		0x0302
+#define SMB311_PROT_ID		0x0311
+#define BAD_PROT_ID		0xFFFF
+
 #define SMB_ECHO_INTERVAL	(60 * HZ)
 
 #define CIFS_DEFAULT_IOSIZE	(64 * 1024)
 #define MAX_CIFS_SMALL_BUFFER_SIZE 448 /* big enough for most */
 
 #define MAX_STREAM_PROT_LEN	0x00FFFFFF
+
+#define IS_SMB2(x)		((x)->vals->protocol_id != SMB10_PROT_ID)
+#define MAX_HEADER_SIZE(conn)		((conn)->vals->max_header_size)
 
 /* Responses when opening a file. */
 #define F_SUPERSEDED	0
@@ -49,6 +62,21 @@
 /*
  * File Attribute flags
  */
+#define ATTR_READONLY			0x0001
+#define ATTR_HIDDEN			0x0002
+#define ATTR_SYSTEM			0x0004
+#define ATTR_VOLUME			0x0008
+#define ATTR_DIRECTORY			0x0010
+#define ATTR_ARCHIVE			0x0020
+#define ATTR_DEVICE			0x0040
+#define ATTR_NORMAL			0x0080
+#define ATTR_TEMPORARY			0x0100
+#define ATTR_SPARSE			0x0200
+#define ATTR_REPARSE			0x0400
+#define ATTR_COMPRESSED			0x0800
+#define ATTR_OFFLINE			0x1000
+#define ATTR_NOT_CONTENT_INDEXED	0x2000
+#define ATTR_ENCRYPTED			0x4000
 #define ATTR_POSIX_SEMANTICS		0x01000000
 #define ATTR_BACKUP_SEMANTICS		0x02000000
 #define ATTR_DELETE_ON_CLOSE		0x04000000
@@ -56,6 +84,23 @@
 #define ATTR_RANDOM_ACCESS		0x10000000
 #define ATTR_NO_BUFFERING		0x20000000
 #define ATTR_WRITE_THROUGH		0x80000000
+
+#define ATTR_READONLY_LE		cpu_to_le32(ATTR_READONLY)
+#define ATTR_HIDDEN_LE			cpu_to_le32(ATTR_HIDDEN)
+#define ATTR_SYSTEM_LE			cpu_to_le32(ATTR_SYSTEM)
+#define ATTR_DIRECTORY_LE		cpu_to_le32(ATTR_DIRECTORY)
+#define ATTR_ARCHIVE_LE			cpu_to_le32(ATTR_ARCHIVE)
+#define ATTR_NORMAL_LE			cpu_to_le32(ATTR_NORMAL)
+#define ATTR_TEMPORARY_LE		cpu_to_le32(ATTR_TEMPORARY)
+#define ATTR_SPARSE_FILE_LE		cpu_to_le32(ATTR_SPARSE)
+#define ATTR_REPARSE_POINT_LE		cpu_to_le32(ATTR_REPARSE)
+#define ATTR_COMPRESSED_LE		cpu_to_le32(ATTR_COMPRESSED)
+#define ATTR_OFFLINE_LE			cpu_to_le32(ATTR_OFFLINE)
+#define ATTR_NOT_CONTENT_INDEXED_LE	cpu_to_le32(ATTR_NOT_CONTENT_INDEXED)
+#define ATTR_ENCRYPTED_LE		cpu_to_le32(ATTR_ENCRYPTED)
+#define ATTR_INTEGRITY_STREAML_LE	cpu_to_le32(0x00008000)
+#define ATTR_NO_SCRUB_DATA_LE		cpu_to_le32(0x00020000)
+#define ATTR_MASK_LE			cpu_to_le32(0x00007FB7)
 
 /* List of FileSystemAttributes - see 2.5.1 of MS-FSCC */
 #define FILE_SUPPORTS_SPARSE_VDL	0x10000000 /* faster nonsparse extend */
@@ -118,6 +163,11 @@
 /* file_execute, file_read_attributes*/
 /* write_dac, and delete.           */
 
+#define FILE_READ_RIGHTS (FILE_READ_DATA | FILE_READ_EA | FILE_READ_ATTRIBUTES)
+#define FILE_WRITE_RIGHTS (FILE_WRITE_DATA | FILE_APPEND_DATA \
+		| FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES)
+#define FILE_EXEC_RIGHTS (FILE_EXECUTE)
+
 #define SET_FILE_READ_RIGHTS (FILE_READ_DATA | FILE_READ_EA \
 		| FILE_READ_ATTRIBUTES \
 		| DELETE | READ_CONTROL | WRITE_DAC \
@@ -156,17 +206,44 @@
 		FILE_EXECUTE | FILE_DELETE_CHILD | \
 		FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
 
+/* DeviceType Flags */
+#define FILE_DEVICE_CD_ROM              0x00000002
+#define FILE_DEVICE_CD_ROM_FILE_SYSTEM  0x00000003
+#define FILE_DEVICE_DFS                 0x00000006
+#define FILE_DEVICE_DISK                0x00000007
+#define FILE_DEVICE_DISK_FILE_SYSTEM    0x00000008
+#define FILE_DEVICE_FILE_SYSTEM         0x00000009
+#define FILE_DEVICE_NAMED_PIPE          0x00000011
+#define FILE_DEVICE_NETWORK             0x00000012
+#define FILE_DEVICE_NETWORK_FILE_SYSTEM 0x00000014
+#define FILE_DEVICE_NULL                0x00000015
+#define FILE_DEVICE_PARALLEL_PORT       0x00000016
+#define FILE_DEVICE_PRINTER             0x00000018
+#define FILE_DEVICE_SERIAL_PORT         0x0000001b
+#define FILE_DEVICE_STREAMS             0x0000001e
+#define FILE_DEVICE_TAPE                0x0000001f
+#define FILE_DEVICE_TAPE_FILE_SYSTEM    0x00000020
+#define FILE_DEVICE_VIRTUAL_DISK        0x00000024
+#define FILE_DEVICE_NETWORK_REDIRECTOR  0x00000028
+
+/* Device Characteristics */
+#define FILE_REMOVABLE_MEDIA			0x00000001
+#define FILE_READ_ONLY_DEVICE			0x00000002
+#define FILE_FLOPPY_DISKETTE			0x00000004
+#define FILE_WRITE_ONCE_MEDIA			0x00000008
+#define FILE_REMOTE_DEVICE			0x00000010
+#define FILE_DEVICE_IS_MOUNTED			0x00000020
+#define FILE_VIRTUAL_VOLUME			0x00000040
+#define FILE_DEVICE_SECURE_OPEN			0x00000100
+#define FILE_CHARACTERISTIC_TS_DEVICE		0x00001000
+#define FILE_CHARACTERISTIC_WEBDAV_DEVICE	0x00002000
+#define FILE_PORTABLE_DEVICE			0x00004000
+#define FILE_DEVICE_ALLOW_APPCONTAINER_TRAVERSAL 0x00020000
+
 #define SMB1_PROTO_NUMBER		cpu_to_le32(0x424d53ff)
 #define SMB_COM_NEGOTIATE		0x72
+
 #define SMB1_CLIENT_GUID_SIZE		(16)
-
-#define SMBFLG_RESPONSE 0x80	/* this PDU is a response from server */
-
-#define SMBFLG2_IS_LONG_NAME	cpu_to_le16(0x40)
-#define SMBFLG2_EXT_SEC		cpu_to_le16(0x800)
-#define SMBFLG2_ERR_STATUS	cpu_to_le16(0x4000)
-#define SMBFLG2_UNICODE		cpu_to_le16(0x8000)
-
 struct smb_hdr {
 	__be32 smb_buf_length;
 	__u8 Protocol[4];
@@ -203,7 +280,7 @@ struct smb_negotiate_req {
 	unsigned char DialectsArray[];
 } __packed;
 
-struct smb_negotiate_rsp {
+struct smb_negotiate_unsupported_rsp {
 	struct smb_hdr hdr;     /* wct = 17 */
 	__le16 DialectIndex; /* 0xFFFF = no dialect acceptable */
 	__le16 ByteCount;
@@ -213,7 +290,7 @@ struct filesystem_attribute_info {
 	__le32 Attributes;
 	__le32 MaxPathNameComponentLength;
 	__le32 FileSystemNameLen;
-	__le16 FileSystemName[1]; /* do not have to save this - get subset? */
+	__le16 FileSystemName[]; /* do not have to save this - get subset? */
 } __packed;
 
 struct filesystem_device_info {
@@ -226,7 +303,7 @@ struct filesystem_vol_info {
 	__le32 SerialNumber;
 	__le32 VolumeLabelSize;
 	__le16 Reserved;
-	__le16 VolumeLabel[1];
+	__le16 VolumeLabel[];
 } __packed;
 
 struct filesystem_info {
@@ -235,6 +312,14 @@ struct filesystem_info {
 	__le32 SectorsPerAllocationUnit;
 	__le32 BytesPerSector;
 } __packed;     /* size info, level 0x103 */
+
+struct filesystem_full_info {
+	__le64 TotalAllocationUnits;
+	__le64 FreeAllocationUnits;
+	__le64 ActualAvailableUnits;
+	__le32 SectorsPerAllocationUnit;
+	__le32 BytesPerSector;
+} __packed;     /* size info, level 0x3ef */
 
 #define EXTENDED_INFO_MAGIC 0x43667364	/* Cfsd */
 #define STRING_LENGTH 28
@@ -427,7 +512,9 @@ bool ksmbd_smb_request(struct ksmbd_conn *conn);
 
 int ksmbd_lookup_dialect_by_id(__le16 *cli_dialects, __le16 dialects_count);
 
-int ksmbd_init_smb_server(struct ksmbd_work *work);
+int ksmbd_init_smb_server(struct ksmbd_conn *conn);
+
+bool ksmbd_pdu_size_has_room(unsigned int pdu);
 
 struct ksmbd_kstat;
 int ksmbd_populate_dot_dotdot_entries(struct ksmbd_work *work,

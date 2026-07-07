@@ -6,6 +6,7 @@ config SMB_SERVER
 	select NLS
 	select NLS_UTF8
 	select CRYPTO
+	select CRYPTO_MD4
 	select CRYPTO_MD5
 	select CRYPTO_HMAC
 	select CRYPTO_ECB
@@ -33,16 +34,24 @@ config SMB_SERVER
 	  in ksmbd-tools, available from
 	  https://github.com/cifsd-team/ksmbd-tools.
 	  More detail about how to run the ksmbd kernel server is
-	  available via the README file
+	  available via README file
 	  (https://github.com/cifsd-team/ksmbd-tools/blob/master/README).
 
 	  ksmbd kernel server includes support for auto-negotiation,
 	  Secure negotiate, Pre-authentication integrity, oplock/lease,
 	  compound requests, multi-credit, packet signing, RDMA(smbdirect),
 	  smb3 encryption, copy-offload, secure per-user session
-	  establishment via Kerberos or NTLMv2.
+	  establishment via NTLM or NTLMv2.
 
-if SMB_SERVER
+config SMB_INSECURE_SERVER
+        bool "Support for insecure SMB1/CIFS and SMB2.0 protocols"
+        depends on SMB_SERVER && INET
+        select NLS
+	default n
+
+        help
+	  This enables deprecated insecure protocols dialects: SMB1/CIFS
+	  and SMB2.0
 
 config SMB_SERVER_SMBDIRECT
 	bool "Support for SMB Direct protocol"
@@ -56,8 +65,6 @@ config SMB_SERVER_SMBDIRECT
 	  SMB Direct allows transferring SMB packets over RDMA. If unsure,
 	  say N.
 
-endif
-
 config SMB_SERVER_CHECK_CAP_NET_ADMIN
 	bool "Enable check network administration capability"
 	depends on SMB_SERVER
@@ -65,8 +72,3 @@ config SMB_SERVER_CHECK_CAP_NET_ADMIN
 
 	help
 	  Prevent unprivileged processes to start the ksmbd kernel server.
-
-config SMB_SERVER_KERBEROS5
-	bool "Support for Kerberos 5"
-	depends on SMB_SERVER
-	default n

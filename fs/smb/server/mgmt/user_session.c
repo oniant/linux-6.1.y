@@ -18,7 +18,7 @@
 
 static DEFINE_IDA(session_ida);
 
-#define SESSION_HASH_BITS		3
+#define SESSION_HASH_BITS		12
 static DEFINE_HASHTABLE(sessions_table, SESSION_HASH_BITS);
 static DECLARE_RWSEM(sessions_table_lock);
 
@@ -100,7 +100,7 @@ int ksmbd_session_rpc_open(struct ksmbd_session *sess, char *rpc_name)
 	if (!method)
 		return -EINVAL;
 
-	entry = kzalloc(sizeof(struct ksmbd_session_rpc), GFP_KERNEL);
+	entry = kzalloc(sizeof(struct ksmbd_session_rpc), KSMBD_DEFAULT_GFP);
 	if (!entry)
 		return -ENOMEM;
 
@@ -110,7 +110,7 @@ int ksmbd_session_rpc_open(struct ksmbd_session *sess, char *rpc_name)
 		goto free_entry;
 
 	down_write(&sess->rpc_lock);
-	old = xa_store(&sess->rpc_handle_list, id, entry, GFP_KERNEL);
+	old = xa_store(&sess->rpc_handle_list, id, entry, KSMBD_DEFAULT_GFP);
 	if (xa_is_err(old)) {
 		up_write(&sess->rpc_lock);
 		goto free_id;
@@ -164,15 +164,15 @@ void ksmbd_session_destroy(struct ksmbd_session *sess)
 
 	ksmbd_tree_conn_session_logoff(sess);
 	ksmbd_destroy_file_table(&sess->file_table);
+	ksmbd_launch_ksmbd_durable_scavenger();
 	ksmbd_session_rpc_clear_list(sess);
 	free_channel_list(sess);
 	kfree(sess->Preauth_HashValue);
 	ksmbd_release_id(&session_ida, sess->id);
-	ida_destroy(&sess->tree_conn_ida);
 	kfree(sess);
 }
 
-static struct ksmbd_session *__session_lookup(unsigned long long id)
+struct ksmbd_session *__session_lookup(unsigned long long id)
 {
 	struct ksmbd_session *sess;
 
@@ -198,7 +198,12 @@ static void ksmbd_expire_session(struct ksmbd_conn *conn)
 		     time_after(jiffies,
 			       sess->last_active + SMB2_SESSION_TIMEOUT))) {
 			xa_erase(&conn->sessions, sess->id);
+#ifdef CONFIG_SMB_INSECURE_SERVER
+			if (hash_hashed(&sess->hlist))
+				hash_del(&sess->hlist);
+#else
 			hash_del(&sess->hlist);
+#endif
 			ksmbd_session_destroy(sess);
 			continue;
 		}
@@ -213,7 +218,7 @@ int ksmbd_session_register(struct ksmbd_conn *conn,
 	sess->dialect = conn->dialect;
 	memcpy(sess->ClientGUID, conn->ClientGUID, SMB2_CLIENT_GUID_SIZE);
 	ksmbd_expire_session(conn);
-	return xa_err(xa_store(&conn->sessions, sess->id, sess, GFP_KERNEL));
+	return xa_err(xa_store(&conn->sessions, sess->id, sess, KSMBD_DEFAULT_GFP));
 }
 
 static int ksmbd_chann_del(struct ksmbd_conn *conn, struct ksmbd_session *sess)
@@ -241,7 +246,12 @@ void ksmbd_sessions_deregister(struct ksmbd_conn *conn)
 		hash_for_each_safe(sessions_table, bkt, tmp, sess, hlist) {
 			if (!ksmbd_chann_del(conn, sess) &&
 			    xa_empty(&sess->ksmbd_chann_list)) {
+#ifdef CONFIG_SMB_INSECURE_SERVER
+				if (hash_hashed(&sess->hlist))
+					hash_del(&sess->hlist);
+#else
 				hash_del(&sess->hlist);
+#endif
 				down_write(&conn->session_lock);
 				xa_erase(&conn->sessions, sess->id);
 				up_write(&conn->session_lock);
@@ -264,7 +274,12 @@ void ksmbd_sessions_deregister(struct ksmbd_conn *conn)
 		ksmbd_chann_del(conn, sess);
 		if (xa_empty(&sess->ksmbd_chann_list)) {
 			xa_erase(&conn->sessions, sess->id);
+#ifdef CONFIG_SMB_INSECURE_SERVER
+			if (hash_hashed(&sess->hlist))
+				hash_del(&sess->hlist);
+#else
 			hash_del(&sess->hlist);
+#endif
 			if (atomic_dec_and_test(&sess->refcnt))
 				ksmbd_session_destroy(sess);
 		}
@@ -323,17 +338,10 @@ struct ksmbd_session *ksmbd_session_lookup_all(struct ksmbd_conn *conn,
 	struct ksmbd_session *sess;
 
 	sess = ksmbd_session_lookup(conn, id);
-	if (!sess && conn->binding) {
+	if (!sess && conn->binding)
 		sess = ksmbd_session_lookup_slowpath(id);
-		if (sess && !xa_load(&sess->ksmbd_chann_list, (long)conn)) {
-			ksmbd_user_session_put(sess);
-			sess = NULL;
-		}
-	}
-	if (sess && sess->state != SMB2_SESSION_VALID) {
-		ksmbd_user_session_put(sess);
+	if (sess && sess->state != SMB2_SESSION_VALID)
 		sess = NULL;
-	}
 	return sess;
 }
 
@@ -358,7 +366,7 @@ struct preauth_session *ksmbd_preauth_session_alloc(struct ksmbd_conn *conn,
 {
 	struct preauth_session *sess;
 
-	sess = kmalloc(sizeof(struct preauth_session), GFP_KERNEL);
+	sess = kmalloc(sizeof(struct preauth_session), KSMBD_DEFAULT_GFP);
 	if (!sess)
 		return NULL;
 
@@ -368,6 +376,42 @@ struct preauth_session *ksmbd_preauth_session_alloc(struct ksmbd_conn *conn,
 	list_add(&sess->preauth_entry, &conn->preauth_sess_table);
 
 	return sess;
+}
+
+void destroy_previous_session(struct ksmbd_conn *conn,
+			      struct ksmbd_user *user, u64 id)
+{
+	struct ksmbd_session *prev_sess;
+	struct ksmbd_user *prev_user;
+	int err;
+
+	down_write(&sessions_table_lock);
+	down_write(&conn->session_lock);
+	prev_sess = __session_lookup(id);
+	if (!prev_sess || prev_sess->state == SMB2_SESSION_EXPIRED)
+		goto out;
+
+	prev_user = prev_sess->user;
+	if (!prev_user ||
+	    strcmp(user->name, prev_user->name) ||
+	    user->passkey_sz != prev_user->passkey_sz ||
+	    memcmp(user->passkey, prev_user->passkey, user->passkey_sz))
+		goto out;
+
+	ksmbd_all_conn_set_status(id, KSMBD_SESS_NEED_RECONNECT);
+	err = ksmbd_conn_wait_idle_sess_id(conn, id);
+	if (err) {
+		ksmbd_all_conn_set_status(id, KSMBD_SESS_NEED_SETUP);
+		goto out;
+	}
+
+	ksmbd_destroy_file_table(&prev_sess->file_table);
+	prev_sess->state = SMB2_SESSION_EXPIRED;
+	ksmbd_all_conn_set_status(id, KSMBD_SESS_NEED_SETUP);
+	ksmbd_launch_ksmbd_durable_scavenger();
+out:
+	up_write(&conn->session_lock);
+        up_write(&sessions_table_lock);
 }
 
 static bool ksmbd_preauth_session_id_match(struct preauth_session *sess,
@@ -388,6 +432,18 @@ struct preauth_session *ksmbd_preauth_session_lookup(struct ksmbd_conn *conn,
 	return NULL;
 }
 
+#ifdef CONFIG_SMB_INSECURE_SERVER
+static int __init_smb1_session(struct ksmbd_session *sess)
+{
+	int id = ksmbd_acquire_smb1_uid(&session_ida);
+
+	if (id < 0)
+		return -EINVAL;
+	sess->id = id;
+	return 0;
+}
+#endif
+
 static int __init_smb2_session(struct ksmbd_session *sess)
 {
 	int id = ksmbd_acquire_smb2_uid(&session_ida);
@@ -403,14 +459,9 @@ static struct ksmbd_session *__session_create(int protocol)
 	struct ksmbd_session *sess;
 	int ret;
 
-	if (protocol != CIFDS_SESSION_FLAG_SMB2)
-		return NULL;
-
-	sess = kzalloc(sizeof(struct ksmbd_session), GFP_KERNEL);
+	sess = kzalloc(sizeof(struct ksmbd_session), KSMBD_DEFAULT_GFP);
 	if (!sess)
 		return NULL;
-
-	ida_init(&sess->tree_conn_ida);
 
 	if (ksmbd_init_file_table(&sess->file_table))
 		goto error;
@@ -426,9 +477,24 @@ static struct ksmbd_session *__session_create(int protocol)
 	atomic_set(&sess->refcnt, 2);
 	init_rwsem(&sess->rpc_lock);
 
-	ret = __init_smb2_session(sess);
+	switch (protocol) {
+#ifdef CONFIG_SMB_INSECURE_SERVER
+	case CIFDS_SESSION_FLAG_SMB1:
+		ret = __init_smb1_session(sess);
+		break;
+#endif
+	case CIFDS_SESSION_FLAG_SMB2:
+		ret = __init_smb2_session(sess);
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
 	if (ret)
 		goto error;
+
+	ida_init(&sess->tree_conn_ida);
 
 	down_write(&sessions_table_lock);
 	hash_add(sessions_table, &sess->hlist, sess->id);
@@ -441,6 +507,13 @@ error:
 	return NULL;
 }
 
+#ifdef CONFIG_SMB_INSECURE_SERVER
+struct ksmbd_session *ksmbd_smb1_session_create(void)
+{
+	return __session_create(CIFDS_SESSION_FLAG_SMB1);
+}
+#endif
+
 struct ksmbd_session *ksmbd_smb2_session_create(void)
 {
 	return __session_create(CIFDS_SESSION_FLAG_SMB2);
@@ -450,6 +523,10 @@ int ksmbd_acquire_tree_conn_id(struct ksmbd_session *sess)
 {
 	int id = -EINVAL;
 
+#ifdef CONFIG_SMB_INSECURE_SERVER
+	if (test_session_flag(sess, CIFDS_SESSION_FLAG_SMB1))
+		id = ksmbd_acquire_smb1_tid(&sess->tree_conn_ida);
+#endif
 	if (test_session_flag(sess, CIFDS_SESSION_FLAG_SMB2))
 		id = ksmbd_acquire_smb2_tid(&sess->tree_conn_ida);
 

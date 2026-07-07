@@ -8,11 +8,34 @@
  */
 #include <linux/fs.h>
 #include <linux/slab.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#include <linux/unaligned.h>
+#else
 #include <asm/unaligned.h>
+#endif
 #include "glob.h"
 #include "unicode.h"
 #include "uniupr.h"
 #include "smb_common.h"
+
+#ifdef CONFIG_SMB_INSECURE_SERVER
+int smb1_utf16_name_length(const __le16 *from, int maxbytes)
+{
+	int i, len = 0;
+	int maxwords = maxbytes / 2;
+	__u16 ftmp;
+
+	for (i = 0; i < maxwords; i++) {
+		ftmp = get_unaligned_le16(&from[i]);
+		len += 2;
+		if (ftmp == 0)
+			break;
+	}
+
+	return len;
+}
+#endif
 
 /*
  * cifs_mapchar() - convert a host-endian char to proper char in codepage
@@ -132,6 +155,24 @@ static int smb_utf16_bytes(const __le16 *from, int maxbytes,
 	}
 
 	return outlen;
+}
+
+/*
+ * is_char_allowed() - check for valid character
+ * @ch:		input character to be checked
+ *
+ * Return:	1 if char is allowed, otherwise 0
+ */
+static inline int is_char_allowed(char *ch)
+{
+	/* check for control chars, wildcards etc. */
+	if (!(*ch & 0x80) &&
+	    (*ch <= 0x1f ||
+	     *ch == '?' || *ch == '"' || *ch == '<' ||
+	     *ch == '>' || *ch == '|'))
+		return 0;
+
+	return 1;
 }
 
 /*
@@ -298,7 +339,7 @@ char *smb_strndup_from_utf16(const char *src, const int maxlen,
 	if (is_unicode) {
 		len = smb_utf16_bytes((__le16 *)src, maxlen, codepage);
 		len += nls_nullsize(codepage);
-		dst = kmalloc(len, GFP_KERNEL);
+		dst = kmalloc(len, KSMBD_DEFAULT_GFP);
 		if (!dst)
 			return ERR_PTR(-ENOMEM);
 		ret = smb_from_utf16(dst, (__le16 *)src, len, maxlen, codepage,
@@ -310,7 +351,7 @@ char *smb_strndup_from_utf16(const char *src, const int maxlen,
 	} else {
 		len = strnlen(src, maxlen);
 		len++;
-		dst = kmalloc(len, GFP_KERNEL);
+		dst = kmalloc(len, KSMBD_DEFAULT_GFP);
 		if (!dst)
 			return ERR_PTR(-ENOMEM);
 		strscpy(dst, src, len);

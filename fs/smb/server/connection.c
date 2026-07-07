@@ -10,6 +10,9 @@
 
 #include "server.h"
 #include "smb_common.h"
+#ifdef CONFIG_SMB_INSECURE_SERVER
+#include "smb1pdu.h"
+#endif
 #include "mgmt/ksmbd_ida.h"
 #include "connection.h"
 #include "transport_tcp.h"
@@ -19,13 +22,13 @@ static DEFINE_MUTEX(init_lock);
 
 static struct ksmbd_conn_ops default_conn_ops;
 
-LIST_HEAD(conn_list);
+DEFINE_HASHTABLE(conn_list, CONN_HASH_BITS);
 DECLARE_RWSEM(conn_list_lock);
 
 /**
  * ksmbd_conn_free() - free resources of the connection instance
  *
- * @conn:	connection instance to be cleand up
+ * @conn:	connection instance to be cleaned up
  *
  * During the thread termination, the corresponding conn instance
  * resources(sock/memory) are released and finally the conn object is freed.
@@ -33,13 +36,16 @@ DECLARE_RWSEM(conn_list_lock);
 void ksmbd_conn_free(struct ksmbd_conn *conn)
 {
 	down_write(&conn_list_lock);
-	list_del(&conn->conns_list);
+	hash_del(&conn->hlist);
 	up_write(&conn_list_lock);
 
 	xa_destroy(&conn->sessions);
 	kvfree(conn->request_buf);
 	kfree(conn->preauth_info);
-	kfree(conn);
+	if (atomic_dec_and_test(&conn->refcnt)) {
+		conn->transport->ops->free_transport(conn->transport);
+		kfree(conn);
+	}
 }
 
 /**
@@ -51,7 +57,7 @@ struct ksmbd_conn *ksmbd_conn_alloc(void)
 {
 	struct ksmbd_conn *conn;
 
-	conn = kzalloc(sizeof(struct ksmbd_conn), GFP_KERNEL);
+	conn = kzalloc(sizeof(struct ksmbd_conn), KSMBD_DEFAULT_GFP);
 	if (!conn)
 		return NULL;
 
@@ -61,19 +67,23 @@ struct ksmbd_conn *ksmbd_conn_alloc(void)
 	if (!conn->local_nls)
 		conn->local_nls = load_nls_default();
 	if (IS_ENABLED(CONFIG_UNICODE))
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
 		conn->um = utf8_load(UNICODE_AGE(12, 1, 0));
+#else
+		conn->um = utf8_load("12.1.0");
+#endif
 	else
 		conn->um = ERR_PTR(-EOPNOTSUPP);
 	if (IS_ERR(conn->um))
 		conn->um = NULL;
 	atomic_set(&conn->req_running, 0);
 	atomic_set(&conn->r_count, 0);
+	atomic_set(&conn->refcnt, 1);
 	conn->total_credits = 1;
 	conn->outstanding_credits = 0;
 
 	init_waitqueue_head(&conn->req_running_q);
 	init_waitqueue_head(&conn->r_count_q);
-	INIT_LIST_HEAD(&conn->conns_list);
 	INIT_LIST_HEAD(&conn->requests);
 	INIT_LIST_HEAD(&conn->async_requests);
 	spin_lock_init(&conn->request_lock);
@@ -86,19 +96,17 @@ struct ksmbd_conn *ksmbd_conn_alloc(void)
 
 	init_rwsem(&conn->session_lock);
 
-	down_write(&conn_list_lock);
-	list_add(&conn->conns_list, &conn_list);
-	up_write(&conn_list_lock);
 	return conn;
 }
 
 bool ksmbd_conn_lookup_dialect(struct ksmbd_conn *c)
 {
 	struct ksmbd_conn *t;
+	int bkt;
 	bool ret = false;
 
 	down_read(&conn_list_lock);
-	list_for_each_entry(t, &conn_list, conns_list) {
+	hash_for_each(conn_list, bkt, t, hlist) {
 		if (memcmp(t->ClientGUID, c->ClientGUID, SMB2_CLIENT_GUID_SIZE))
 			continue;
 
@@ -113,12 +121,23 @@ void ksmbd_conn_enqueue_request(struct ksmbd_work *work)
 {
 	struct ksmbd_conn *conn = work->conn;
 	struct list_head *requests_queue = NULL;
+#ifdef CONFIG_SMB_INSECURE_SERVER
+	struct smb2_hdr *hdr = work->request_buf;
 
+	if (hdr->ProtocolId == SMB2_PROTO_NUMBER) {
+		if (conn->ops->get_cmd_val(work) != SMB2_CANCEL_HE)
+			requests_queue = &conn->requests;
+	} else {
+		if (conn->ops->get_cmd_val(work) != SMB_COM_NT_CANCEL)
+			requests_queue = &conn->requests;
+	}
+#else
 	if (conn->ops->get_cmd_val(work) != SMB2_CANCEL_HE)
 		requests_queue = &conn->requests;
+#endif
 
+	atomic_inc(&conn->req_running);
 	if (requests_queue) {
-		atomic_inc(&conn->req_running);
 		spin_lock(&conn->request_lock);
 		list_add_tail(&work->request_entry, requests_queue);
 		spin_unlock(&conn->request_lock);
@@ -129,11 +148,14 @@ void ksmbd_conn_try_dequeue_request(struct ksmbd_work *work)
 {
 	struct ksmbd_conn *conn = work->conn;
 
+	atomic_dec(&conn->req_running);
+	if (waitqueue_active(&conn->req_running_q))
+		wake_up(&conn->req_running_q);
+
 	if (list_empty(&work->request_entry) &&
 	    list_empty(&work->async_request_entry))
 		return;
 
-	atomic_dec(&conn->req_running);
 	spin_lock(&conn->request_lock);
 	list_del_init(&work->request_entry);
 	spin_unlock(&conn->request_lock);
@@ -156,18 +178,51 @@ void ksmbd_conn_unlock(struct ksmbd_conn *conn)
 void ksmbd_all_conn_set_status(u64 sess_id, u32 status)
 {
 	struct ksmbd_conn *conn;
+	int bkt;
 
 	down_read(&conn_list_lock);
-	list_for_each_entry(conn, &conn_list, conns_list) {
+	hash_for_each(conn_list, bkt, conn, hlist) {
 		if (conn->binding || xa_load(&conn->sessions, sess_id))
 			WRITE_ONCE(conn->status, status);
 	}
 	up_read(&conn_list_lock);
 }
 
-void ksmbd_conn_wait_idle(struct ksmbd_conn *conn, u64 sess_id)
+void ksmbd_conn_wait_idle(struct ksmbd_conn *conn)
 {
 	wait_event(conn->req_running_q, atomic_read(&conn->req_running) < 2);
+}
+
+int ksmbd_conn_wait_idle_sess_id(struct ksmbd_conn *curr_conn, u64 sess_id)
+{
+	struct ksmbd_conn *conn;
+	int rc, retry_count = 0, max_timeout = 120;
+	int rcount = 1, bkt;
+
+retry_idle:
+	if (retry_count >= max_timeout)
+		return -EIO;
+
+	down_read(&conn_list_lock);
+	hash_for_each(conn_list, bkt, conn, hlist) {
+		if (conn->binding || xa_load(&conn->sessions, sess_id)) {
+			if (conn == curr_conn)
+				rcount = 2;
+			if (atomic_read(&conn->req_running) >= rcount) {
+				rc = wait_event_timeout(conn->req_running_q,
+					atomic_read(&conn->req_running) < rcount,
+					HZ);
+				if (!rc) {
+					up_read(&conn_list_lock);
+					retry_count++;
+					goto retry_idle;
+				}
+			}
+		}
+	}
+	up_read(&conn_list_lock);
+
+	return 0;
 }
 
 int ksmbd_conn_write(struct ksmbd_work *work)
@@ -183,6 +238,39 @@ int ksmbd_conn_write(struct ksmbd_work *work)
 	if (work->send_no_response)
 		return 0;
 
+#ifdef CONFIG_SMB_INSECURE_SERVER
+	if (!work->iov_idx) {
+		struct kvec iov[2];
+		int iov_idx = 0;
+		size_t len = 0;
+
+		if (work->aux_payload_sz) {
+			iov[iov_idx] = (struct kvec) { work->response_buf, work->resp_hdr_sz };
+			len += iov[iov_idx++].iov_len;
+			iov[iov_idx] = (struct kvec) { work->aux_payload_buf, work->aux_payload_sz };
+			len += iov[iov_idx++].iov_len;
+		} else {
+			iov[iov_idx].iov_len = get_rfc1002_len(work->response_buf) + 4;
+			iov[iov_idx].iov_base = work->response_buf;
+			len += iov[iov_idx++].iov_len;
+		}
+
+		ksmbd_conn_lock(conn);
+		sent = conn->transport->ops->writev(conn->transport, &iov[0],
+				iov_idx, len, work->need_invalidate_rkey,
+				work->remote_key);
+		ksmbd_conn_unlock(conn);
+
+	} else {
+		ksmbd_conn_lock(conn);
+		sent = conn->transport->ops->writev(conn->transport, work->iov,
+				work->iov_cnt,
+				get_rfc1002_len(work->iov[0].iov_base) + 4,
+				work->need_invalidate_rkey,
+				work->remote_key);
+		ksmbd_conn_unlock(conn);
+	}
+#else
 	if (!work->iov_idx)
 		return -EINVAL;
 
@@ -193,6 +281,7 @@ int ksmbd_conn_write(struct ksmbd_work *work)
 			work->need_invalidate_rkey,
 			work->remote_key);
 	ksmbd_conn_unlock(conn);
+#endif
 
 	if (sent < 0) {
 		pr_err("Failed to send message: %d\n", sent);
@@ -273,7 +362,7 @@ int ksmbd_conn_handler_loop(void *p)
 {
 	struct ksmbd_conn *conn = (struct ksmbd_conn *)p;
 	struct ksmbd_transport *t = conn->transport;
-	unsigned int pdu_size, max_allowed_pdu_size;
+	unsigned int pdu_size, max_allowed_pdu_size, max_req;
 	char hdr_buf[4] = {0,};
 	int size;
 
@@ -283,6 +372,7 @@ int ksmbd_conn_handler_loop(void *p)
 	if (t->ops->prepare && t->ops->prepare(t))
 		goto out;
 
+	max_req = server_conf.max_inflight_req;
 	conn->last_active = jiffies;
 	set_freezable();
 	while (ksmbd_conn_alive(conn)) {
@@ -291,6 +381,13 @@ int ksmbd_conn_handler_loop(void *p)
 
 		kvfree(conn->request_buf);
 		conn->request_buf = NULL;
+
+recheck:
+		if (atomic_read(&conn->req_running) + 1 > max_req) {
+			wait_event_interruptible(conn->req_running_q,
+				atomic_read(&conn->req_running) < max_req);
+			goto recheck;
+		}
 
 		size = t->ops->read(t, hdr_buf, sizeof(hdr_buf), -1);
 		if (size != sizeof(hdr_buf))
@@ -306,7 +403,7 @@ int ksmbd_conn_handler_loop(void *p)
 			max_allowed_pdu_size = SMB3_MAX_MSGSIZE;
 
 		if (pdu_size > max_allowed_pdu_size) {
-			pr_err_ratelimited("PDU length(%u) exceeded maximum allowed pdu size(%u) on connection(%d)\n",
+			pr_err_ratelimited("PDU length(%u) excceed maximum allowed pdu size(%u) on connection(%d)\n",
 					pdu_size, max_allowed_pdu_size,
 					READ_ONCE(conn->status));
 			break;
@@ -324,7 +421,7 @@ int ksmbd_conn_handler_loop(void *p)
 		/* 4 for rfc1002 length field */
 		/* 1 for implied bcc[0] */
 		size = pdu_size + 4 + 1;
-		conn->request_buf = kvmalloc(size, GFP_KERNEL);
+		conn->request_buf = kvmalloc(size, KSMBD_DEFAULT_GFP);
 		if (!conn->request_buf)
 			break;
 
@@ -369,6 +466,7 @@ int ksmbd_conn_handler_loop(void *p)
 out:
 	ksmbd_conn_set_releasing(conn);
 	/* Wait till all reference dropped to the Server object*/
+	ksmbd_debug(CONN, "Wait for all pending requests(%d)\n", atomic_read(&conn->r_count));
 	wait_event(conn->r_count_q, atomic_read(&conn->r_count) == 0);
 
 	if (IS_ENABLED(CONFIG_UNICODE))
@@ -385,6 +483,26 @@ void ksmbd_conn_init_server_callbacks(struct ksmbd_conn_ops *ops)
 {
 	default_conn_ops.process_fn = ops->process_fn;
 	default_conn_ops.terminate_fn = ops->terminate_fn;
+}
+
+void ksmbd_conn_r_count_inc(struct ksmbd_conn *conn)
+{
+	atomic_inc(&conn->r_count);
+}
+
+void ksmbd_conn_r_count_dec(struct ksmbd_conn *conn)
+{
+	/*
+	 * Checking waitqueue to dropping pending requests on
+	 * disconnection. waitqueue_active is safe because it
+	 * uses atomic operation for condition.
+	 */
+	atomic_inc(&conn->refcnt);
+	if (!atomic_dec_return(&conn->r_count) && waitqueue_active(&conn->r_count_q))
+		wake_up(&conn->r_count_q);
+
+	if (atomic_dec_and_test(&conn->refcnt))
+		kfree(conn);
 }
 
 int ksmbd_conn_transport_init(void)
@@ -412,10 +530,11 @@ static void stop_sessions(void)
 {
 	struct ksmbd_conn *conn;
 	struct ksmbd_transport *t;
+	int bkt;
 
 again:
 	down_read(&conn_list_lock);
-	list_for_each_entry(conn, &conn_list, conns_list) {
+	hash_for_each(conn_list, bkt, conn, hlist) {
 		t = conn->transport;
 		ksmbd_conn_set_exiting(conn);
 		if (t->ops->shutdown) {
@@ -426,8 +545,8 @@ again:
 	}
 	up_read(&conn_list_lock);
 
-	if (!list_empty(&conn_list)) {
-		schedule_timeout_interruptible(HZ / 10); /* 100ms */
+	if (!hash_empty(conn_list)) {
+		msleep(100);
 		goto again;
 	}
 }
